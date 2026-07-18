@@ -19,7 +19,7 @@ import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_from_directory
 from PIL import Image
 
-from phdet import extract_palette, match_color, pick_sample_color
+from phdet import aggregate_sample_colors, extract_palette, match_color
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -156,6 +156,52 @@ PAGE = """
         }
         #sample-canvas { cursor: crosshair; width: 100%; border-radius: 0.5rem; }
         .coords { font-family: monospace; background: #f3f4f6; padding: 0.2rem 0.4rem; border-radius: 0.3rem; }
+        .point-list {
+            margin-top: 0.5rem;
+            max-height: 120px;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            padding: 0.5rem;
+            font-size: 0.85rem;
+            display: none;
+        }
+        .point-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.25rem 0;
+            border-bottom: 1px solid #f3f4f6;
+        }
+        .point-item:last-child { border-bottom: none; }
+        .point-remove {
+            background: #fee2e2;
+            color: #991b1b;
+            border: none;
+            border-radius: 0.3rem;
+            padding: 0.1rem 0.4rem;
+            cursor: pointer;
+            font-size: 0.8rem;
+        }
+        .point-actions {
+            margin-top: 0.5rem;
+            display: flex;
+            gap: 0.5rem;
+        }
+        .point-actions button {
+            flex: 1;
+            padding: 0.4rem;
+            border: 1px solid var(--border);
+            border-radius: 0.4rem;
+            background: white;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+        .hint {
+            font-size: 0.8rem;
+            color: var(--muted);
+            margin-top: 0.25rem;
+        }
     </style>
 </head>
 <body>
@@ -185,15 +231,18 @@ PAGE = """
                     <div style="position:relative;">
                         <canvas id="sample-canvas"></canvas>
                     </div>
-                    <p class="info">Ընտրված կետ՝ <span id="point" class="coords">դեռ չի ընտրվել</span></p>
-                    <input type="hidden" id="point-x" name="point_x">
-                    <input type="hidden" id="point-y" name="point_y">
+                    <p class="hint">Ձախ կտտոց՝ ավելացնել կետ, աջ կտտոց՝ ջնջել ամենամոտիկը</p>
+                    <div id="point-list" class="point-list"></div>
+                    <div class="point-actions">
+                        <button type="button" id="clear-points">Մաքրել կետերը</button>
+                    </div>
+                    <input type="hidden" id="points-json" name="points_json">
                 </div>
             </div>
 
             <div class="card" style="margin-top: 1.5rem;">
                 <h2>3. Կարգավորումներ</h2>
-                <div class="grid" style="grid-template-columns: 1fr 1fr 1fr;">
+                <div class="grid" style="grid-template-columns: 1fr 1fr 1fr 1fr;">
                     <div>
                         <label for="size">Նմուշի չափ (px)</label>
                         <input type="number" id="size" name="size" value="40" min="5" max="200">
@@ -205,6 +254,14 @@ PAGE = """
                             <option value="lab">Lab ΔE</option>
                             <option value="hsv">HSV</option>
                             <option value="rgb">RGB</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="aggregate">Համախմբում</label>
+                        <select id="aggregate" name="aggregate">
+                            <option value="median" selected>Median</option>
+                            <option value="mean">Mean</option>
+                            <option value="robust">Robust</option>
                         </select>
                     </div>
                     <div>
@@ -226,6 +283,7 @@ PAGE = """
         <div id="error" class="error"></div>
         <div id="result" class="result">
             <h3>Արդյունք</h3>
+            <p id="points-info" style="display:none;">Ընտրված կետերի քանակ՝ <strong id="n-points"></strong>, համախմբման մեթոդ՝ <span id="agg-method"></span>, վստահելիություն՝ <strong id="confidence"></strong></p>
             <p><span class="swatch" id="sample-swatch"></span> Նմուշի RGB՝ <span id="rgb"></span></p>
             <p>Ամենամոտիկ pH՝ <strong id="ph" style="font-size:1.5rem;"></strong></p>
             <p id="interp-line">Հարթեցված pH՝ <span id="ph-interp"></span></p>
@@ -243,9 +301,9 @@ PAGE = """
         const palettePreview = document.getElementById('palette-preview');
         const sampleCanvas = document.getElementById('sample-canvas');
         const ctx = sampleCanvas.getContext('2d');
-        const pointSpan = document.getElementById('point');
-        const pointX = document.getElementById('point-x');
-        const pointY = document.getElementById('point-y');
+        const pointsJson = document.getElementById('points-json');
+        const pointList = document.getElementById('point-list');
+        const clearPointsBtn = document.getElementById('clear-points');
         const submitBtn = document.getElementById('submit-btn');
         const form = document.getElementById('ph-form');
         const errorDiv = document.getElementById('error');
@@ -253,6 +311,7 @@ PAGE = """
 
         let sampleImg = null;
         let scale = 1;
+        let points = [];
 
         function showError(msg) {
             errorDiv.textContent = msg;
@@ -264,7 +323,58 @@ PAGE = """
             errorDiv.style.display = 'none';
         }
         function updateSubmit() {
-            submitBtn.disabled = !(paletteInput.files[0] && sampleInput.files[0] && pointX.value);
+            submitBtn.disabled = !(paletteInput.files[0] && sampleInput.files[0] && points.length > 0);
+        }
+
+        function updatePointsJson() {
+            pointsJson.value = JSON.stringify(points);
+        }
+
+        function renderPoints() {
+            pointList.innerHTML = '';
+            if (points.length === 0) {
+                pointList.style.display = 'none';
+                updateSubmit();
+                updatePointsJson();
+                redrawCanvas();
+                return;
+            }
+            pointList.style.display = 'block';
+            points.forEach((p, i) => {
+                const item = document.createElement('div');
+                item.className = 'point-item';
+                item.innerHTML = `
+                    <span>#${i + 1}: (${Math.round(p.x)}, ${Math.round(p.y)})</span>
+                    <button type="button" class="point-remove" data-index="${i}">×</button>
+                `;
+                pointList.appendChild(item);
+            });
+            pointList.querySelectorAll('.point-remove').forEach(btn => {
+                btn.addEventListener('click', function() {
+                    points.splice(parseInt(this.dataset.index), 1);
+                    renderPoints();
+                });
+            });
+            updatePointsJson();
+            updateSubmit();
+            redrawCanvas();
+        }
+
+        function redrawCanvas() {
+            if (!sampleImg) return;
+            ctx.drawImage(sampleImg, 0, 0);
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 4;
+            ctx.fillStyle = '#00ff00';
+            const size = parseInt(document.getElementById('size').value) || 40;
+            points.forEach((p, i) => {
+                ctx.strokeRect(p.x - size, p.y - size, size * 2, size * 2);
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 5, 0, 2 * Math.PI);
+                ctx.fill();
+                ctx.font = '16px sans-serif';
+                ctx.fillText(String(i + 1), p.x + 8, p.y - 8);
+            });
         }
 
         function handleFile(input, preview, isSample) {
@@ -273,6 +383,8 @@ PAGE = """
             clearError();
             const url = URL.createObjectURL(file);
             if (isSample) {
+                points = [];
+                renderPoints();
                 sampleImg = new Image();
                 sampleImg.onload = function() {
                     sampleCanvas.width = sampleImg.naturalWidth;
@@ -293,6 +405,10 @@ PAGE = """
             updateSubmit();
         }
 
+        document.getElementById('size').addEventListener('input', function() {
+            redrawCanvas();
+        });
+
         paletteInput.addEventListener('change', () => handleFile(paletteInput, palettePreview, false));
         sampleInput.addEventListener('change', () => handleFile(sampleInput, null, true));
 
@@ -301,21 +417,32 @@ PAGE = """
             const rect = sampleCanvas.getBoundingClientRect();
             const x = (e.clientX - rect.left) / scale;
             const y = (e.clientY - rect.top) / scale;
-            pointX.value = Math.round(x);
-            pointY.value = Math.round(y);
-            pointSpan.textContent = `(${Math.round(x)}, ${Math.round(y)})`;
+            points.push({x: x, y: y});
+            renderPoints();
+        });
 
-            // redraw with marker
-            ctx.drawImage(sampleImg, 0, 0);
-            ctx.strokeStyle = '#00ff00';
-            ctx.lineWidth = 4;
-            const size = parseInt(document.getElementById('size').value) || 40;
-            ctx.strokeRect(x - size, y - size, size * 2, size * 2);
-            ctx.fillStyle = '#00ff00';
-            ctx.beginPath();
-            ctx.arc(x, y, 5, 0, 2 * Math.PI);
-            ctx.fill();
-            updateSubmit();
+        sampleCanvas.addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+            if (!sampleImg || points.length === 0) return;
+            const rect = sampleCanvas.getBoundingClientRect();
+            const x = (e.clientX - rect.left) / scale;
+            const y = (e.clientY - rect.top) / scale;
+            let nearest = 0;
+            let nearestDist = Infinity;
+            points.forEach((p, i) => {
+                const d = (p.x - x) ** 2 + (p.y - y) ** 2;
+                if (d < nearestDist) {
+                    nearestDist = d;
+                    nearest = i;
+                }
+            });
+            points.splice(nearest, 1);
+            renderPoints();
+        });
+
+        clearPointsBtn.addEventListener('click', function() {
+            points = [];
+            renderPoints();
         });
 
         form.addEventListener('submit', async function(e) {
@@ -338,6 +465,15 @@ PAGE = """
                 document.getElementById('lab-ph').textContent = data.per_method.lab;
                 document.getElementById('hsv-ph').textContent = data.per_method.hsv;
                 document.getElementById('rgb-ph').textContent = data.per_method.rgb;
+                const pointsInfo = document.getElementById('points-info');
+                if (data.n_points && data.n_points > 1) {
+                    pointsInfo.style.display = 'block';
+                    document.getElementById('n-points').textContent = data.n_points;
+                    document.getElementById('agg-method').textContent = data.aggregate || 'median';
+                    document.getElementById('confidence').textContent = (data.confidence * 100).toFixed(1) + '%';
+                } else {
+                    pointsInfo.style.display = 'none';
+                }
                 const interpLine = document.getElementById('interp-line');
                 if (data.ph_interp !== undefined) {
                     interpLine.style.display = 'block';
@@ -404,35 +540,41 @@ def analyze():
         palette_path = save_upload(palette_file)
         sample_path = save_upload(sample_file)
 
-        point_x = request.form.get("point_x", type=int)
-        point_y = request.form.get("point_y", type=int)
+        points_json = request.form.get("points_json")
         size = request.form.get("size", 40, type=int)
         method = request.form.get("method", "combined")
+        aggregate = request.form.get("aggregate", "median")
         n_colors = request.form.get("n_colors", 14, type=int)
         white_balance = request.form.get("white_balance") == "on"
         use_interp = request.form.get("interp") == "on"
 
-        if point_x is None or point_y is None:
-            # default to center
-            img = Image.open(sample_path)
-            point_x = img.width // 2
-            point_y = img.height // 2
+        # Parse points (fallback to image center if none provided)
+        smp_img = Image.open(sample_path)
+        if points_json:
+            raw_points = json.loads(points_json)
+            points = [(int(p["x"]), int(p["y"])) for p in raw_points]
+        else:
+            points = [(smp_img.width // 2, smp_img.height // 2)]
 
         # Extract palette
         pal_img = Image.open(palette_path)
-        palette, positions, band = extract_palette(pal_img, n_colors=n_colors)
+        palette, positions, band, ph_min = extract_palette(pal_img, n_colors=n_colors)
 
-        # Pick sample
-        smp_img = Image.open(sample_path)
-        sample_rgb, sample_region = pick_sample_color(
-            smp_img,
-            point=(point_x, point_y),
-            size=size,
-            white_balance=white_balance,
+        # Pick sample color(s)
+        sample_rgb, confidence, details = aggregate_sample_colors(
+            smp_img, points, size=size, method=aggregate, white_balance=white_balance
         )
+        n_points = len(points)
 
         # Match
         result = match_color(sample_rgb, palette, use_interp=use_interp, method=method)
+
+        # Convert internal 0-based index to actual pH value
+        ph_value = result["ph"] + ph_min
+        ph_interp_value = result.get("ph_interp")
+        if ph_interp_value is not None:
+            ph_interp_value += ph_min
+        per_method_values = {m: v + ph_min for m, v in result.get("per_method", {}).items()}
 
         # Draw result image
         result_name = f"result_{uuid.uuid4().hex}.jpg"
@@ -445,15 +587,18 @@ def analyze():
             for i, (cx, cy) in enumerate(positions):
                 color = tuple(int(c) for c in palette[i])
                 text_color = (255, 255, 255) if sum(color) < 380 else (0, 0, 0)
-                cv2.putText(pal_bgr, str(i), (cx - 10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+                cv2.putText(pal_bgr, str(i + ph_min), (cx - 10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
 
-            x, y, w, h = sample_region
-            ph = result["ph"]
-            cv2.rectangle(smp_bgr, (x, y), (x + w, y + h), (0, 255, 0), 3)
-            label = f"pH ~ {ph}"
-            if "ph_interp" in result:
-                label += f" ({result['ph_interp']:.1f})"
-            cv2.putText(smp_bgr, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            for i, d in enumerate(details):
+                x, y, w, h = d["region"]
+                cv2.rectangle(smp_bgr, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                cv2.circle(smp_bgr, (x + w // 2, y + h // 2), 5, (0, 0, 255), -1)
+                cv2.putText(smp_bgr, str(i + 1), (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            label = f"pH ~ {ph_value}"
+            if ph_interp_value is not None:
+                label += f" ({ph_interp_value:.1f})"
+            # place final label at top-left of sample image
+            cv2.putText(smp_bgr, label, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
             # concatenate side by side
             target_h = 400
@@ -467,12 +612,15 @@ def analyze():
 
         return jsonify(
             {
-                "ph": result["ph"],
+                "ph": ph_value,
                 "distance": result["distance"],
                 "rgb": [int(c) for c in sample_rgb],
-                "per_method": result.get("per_method", {}),
-                "ph_interp": result.get("ph_interp"),
+                "per_method": per_method_values,
+                "ph_interp": ph_interp_value,
                 "result_image": result_image_url,
+                "n_points": n_points,
+                "aggregate": aggregate,
+                "confidence": confidence,
             }
         )
 

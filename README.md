@@ -10,7 +10,8 @@ The user interface is in Armenian, but the code and this README are in English.
 - Multiple color matching methods: CIE Lab ΔE, HSV hue/saturation, RGB Euclidean, and a combined Lab+HSV approach
 - Optional white balance on the sample region
 - Interactive OpenCV point picker for CLI usage
-- Flask web UI: upload palette + sample, click on the test strip, get pH
+- **Multi-point aggregation**: pick several points on the test strip and combine their colors with mean, median, or robust aggregation
+- Flask web UI: upload palette + sample, click on the test strip (or multiple points), get pH
 - Result visualization with marked palette band and sample region
 
 ## Requirements
@@ -59,12 +60,28 @@ python phdet.py photo1_scale.png photo1_strip_region.png \
     --point 120 180 --size 40 --visualize --save result.jpg
 ```
 
+Multi-point aggregation from CLI coordinates:
+
+```bash
+python phdet.py photo1_scale.png photo1_strip_region.png \
+    --points 120 180 250 180 380 180 --size 30 --aggregate robust --interp
+```
+
+Interactive multi-point selection:
+
+```bash
+python phdet.py photo1_scale.png photo1_strip_region.png --interactive --multi
+```
+
 Available options:
 
 - `--point X Y` — sample center coordinates
+- `--points X1 Y1 X2 Y2 ...` — multiple sample centers for aggregation
 - `--size N` — half side of the sample square (default 20)
 - `--crop X Y W H` — rectangular sample region
-- `--interactive` — pick point with the mouse
+- `--interactive` — pick point(s) with the mouse
+- `--multi` — when combined with `--interactive`, collect multiple points (Enter to finish)
+- `--aggregate {mean,median,robust}` — aggregation method for multiple points (default: median)
 - `--visualize` — show result windows
 - `--save PATH` — save annotated result image
 - `--white-balance` — apply gray-world white balance
@@ -86,15 +103,18 @@ Then open [http://127.0.0.1:5000](http://127.0.0.1:5000) in a browser.
 
 1. Upload the pH palette / scale image.
 2. Upload the test strip image.
-3. Click on the colored part of the test strip.
-4. Adjust settings if needed.
-5. Press **«Հաշվել pH»** to get the result.
+3. Click on the colored part of the test strip (add multiple points for aggregation).
+4. Right-click (or use the × button) to remove unwanted points.
+5. Choose an aggregation method (`mean`, `median`, or `robust`) if multiple points are selected.
+6. Adjust other settings if needed.
+7. Press **«Հաշվել pH»** to get the result.
 
 ## How It Works
 
 1. **Palette extraction**: detects the colored horizontal band in the palette image, splits it into `n_colors` segments using weighted 1D K-Means, and computes the mean RGB of each segment.
-2. **Sample color**: averages the pixels in a square region around the selected point, optionally applying white balance.
-3. **Matching**: computes color distances between the sample and each palette entry, then returns the closest pH index. Optional interpolation gives a continuous pH estimate.
+2. **Sample color**: averages the pixels in a square region around each selected point, optionally applying white balance.
+3. **Aggregation** (when multiple points are selected): combines the per-point colors using `mean`, `median`, or `robust` (outlier-resistant) aggregation and reports a confidence score based on point agreement.
+4. **Matching**: computes color distances between the aggregated sample and each palette entry, then returns the closest pH index. Optional interpolation gives a continuous pH estimate.
 
 ## Example Output
 
